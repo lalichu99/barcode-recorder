@@ -70,8 +70,8 @@ import re
 import subprocess
 import sys
 import time
+import queue
 import uuid
-import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -108,10 +108,6 @@ FOURCC = "XVID"
 WINDOW_NAME = "Barcode Recorder"
 ACCEPT_COOLDOWN = 5.0
 MAX_CAMERA_IDX = 10
-
-# GitHub repo để check update (đổi thành repo của bạn)
-GITHUB_REPO = "YOUR_USERNAME/YOUR_REPO"   # ví dụ: "nguyenvana/barcode-recorder"
-GITHUB_EXE_NAME = "BarcodeRecorder.exe"   # tên file exe trong GitHub Release
 
 BG_APP = "#f5f3ef"
 BG_CARD = "#ffffff"
@@ -517,22 +513,10 @@ def make_vietqr_url(bank_id: str, account_no: str, account_name: str, amount: in
     )
 
 
-def fetch_qr_pil_image(qr_url: str) -> Image.Image | None:
-    try:
-        resp = requests.get(qr_url, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        img = Image.open(BytesIO(resp.content)).convert("RGB")
-        img.thumbnail((280, 280))
-        return img
-    except Exception as exc:
-        print("QR fetch error:", exc)
-        return None
-
 # ══════════════════════════════════════════════════════════════════════════════
 # Auto-Update (GitHub Releases)
 # ══════════════════════════════════════════════════════════════════════════════
 def _parse_version(v: str) -> tuple[int, ...]:
-    """'1.2.0' → (1, 2, 0)"""
     try:
         return tuple(int(x) for x in str(v).strip().lstrip("v").split("."))
     except Exception:
@@ -540,11 +524,6 @@ def _parse_version(v: str) -> tuple[int, ...]:
 
 
 def check_for_update() -> dict[str, Any] | None:
-    """
-    Gọi GitHub API để kiểm tra bản mới nhất.
-    Trả về dict nếu có bản mới hơn APP_VERSION, ngược lại None.
-    Chạy trong background thread — không block UI.
-    """
     try:
         url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
         r = requests.get(url, timeout=10, headers={"Accept": "application/vnd.github+json"})
@@ -553,9 +532,8 @@ def check_for_update() -> dict[str, Any] | None:
 
         latest_tag = str(data.get("tag_name", "0")).lstrip("v")
         if _parse_version(latest_tag) <= _parse_version(APP_VERSION):
-            return None  # đang dùng bản mới nhất rồi
+            return None
 
-        # Tìm asset là file exe
         download_url = ""
         for asset in data.get("assets", []):
             name = str(asset.get("name", ""))
@@ -578,7 +556,6 @@ def check_for_update() -> dict[str, Any] | None:
 
 
 def _download_update(url: str, dest: Path, progress_cb=None) -> None:
-    """Tải file theo chunk, gọi progress_cb(pct: int) mỗi 64 KB."""
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         total = int(r.headers.get("Content-Length", 0))
@@ -593,10 +570,6 @@ def _download_update(url: str, dest: Path, progress_cb=None) -> None:
 
 
 def _write_updater_bat(new_exe: Path, current_exe: Path) -> Path:
-    """
-    Tạo file .bat thay thế exe cũ bằng exe mới rồi khởi động lại.
-    Dùng timeout 3 giây để chờ process cũ thoát.
-    """
     bat_path = new_exe.parent / "_updater.bat"
     bat_content = f"""@echo off
 timeout /t 3 /nobreak >nul
@@ -609,16 +582,11 @@ del "%~f0"
 
 
 def show_update_dialog(update_info: dict[str, Any]) -> None:
-    """
-    Hiện dialog thông báo bản mới, hỏi user có muốn tải không.
-    Nếu đồng ý → hiện progress bar tải → chạy updater bat → thoát.
-    """
     latest = update_info["latest"]
     current = update_info["current"]
     notes = update_info.get("release_notes", "")
     download_url = update_info["download_url"]
 
-    # --- Dialog thông báo ---
     confirm = messagebox.askyesno(
         f"Có bản cập nhật mới — v{latest}",
         f"Phiên bản hiện tại: v{current}\n"
@@ -631,7 +599,6 @@ def show_update_dialog(update_info: dict[str, Any]) -> None:
     if not confirm:
         return
 
-    # --- Window tiến trình tải ---
     dl_win = _toplevel("Đang tải cập nhật...", "460x140", resizable=False)
     dl_frame = _make_main_container(dl_win, 20)
     ttk.Label(dl_frame, text=f"Đang tải v{latest}...", style="Title.TLabel").pack(anchor="w")
@@ -642,12 +609,9 @@ def show_update_dialog(update_info: dict[str, Any]) -> None:
 
     dl_win.update()
 
-    # Xác định đường dẫn
     if getattr(sys, "frozen", False):
-        # Đang chạy từ PyInstaller exe
         current_exe = Path(sys.executable)
     else:
-        # Dev mode — giả lập
         current_exe = Path(sys.argv[0])
 
     new_exe = current_exe.parent / f"_update_{latest}.exe"
@@ -663,7 +627,6 @@ def show_update_dialog(update_info: dict[str, Any]) -> None:
 
             _download_update(download_url, new_exe, progress_cb=on_progress)
 
-            # Tải xong → tạo bat → chạy → thoát
             def _finish():
                 bar.configure(value=100)
                 pct_var.set("100% — Đang khởi động lại...")
@@ -679,7 +642,6 @@ def show_update_dialog(update_info: dict[str, Any]) -> None:
                     messagebox.showerror("Lỗi", f"Không thể chạy updater:\n{e}", parent=dl_win)
                     dl_win.destroy()
                     return
-                # Thoát app hiện tại
                 dl_win.destroy()
                 _get_root().quit()
                 sys.exit(0)
@@ -705,14 +667,9 @@ def show_update_dialog(update_info: dict[str, Any]) -> None:
 
 
 def check_update_async() -> None:
-    """
-    Kiểm tra update trong background. Nếu có bản mới thì hiện dialog.
-    Gọi ngay sau khi license check thành công để không delay khởi động.
-    """
     def _worker():
         info = check_for_update()
         if info:
-            # Phải schedule về main thread vì Tk không thread-safe
             _get_root().after(0, lambda: show_update_dialog(info))
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -872,8 +829,6 @@ def _expires_label(expires_at: str) -> str:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # show_renewal_window
-# FIX: gọi public-config + create-order + fetch QR song song (ThreadPoolExecutor)
-#      thay vì tuần tự → giảm thời gian chờ từ ~3×timeout xuống ~1×timeout
 # ══════════════════════════════════════════════════════════════════════════════
 def show_renewal_window(config: dict[str, Any], reason_text: str = "") -> None:
     email = str(config.get("email", "")).strip().lower()
@@ -917,7 +872,6 @@ def show_renewal_window(config: dict[str, Any], reason_text: str = "") -> None:
         wraplength=760,
     ).pack(anchor="w", pady=(0, 10))
 
-    # Progress bar hiển thị khi đang tải
     loading_bar = ttk.Progressbar(frame, mode="indeterminate")
     loading_bar.pack(fill="x", pady=(0, 10))
     loading_bar.start(12)
@@ -963,11 +917,12 @@ def show_renewal_window(config: dict[str, Any], reason_text: str = "") -> None:
     order_data: dict[str, Any] = {}
     public_cfg: dict[str, Any] = {}
 
-    # Nút ban đầu disabled, chờ tải xong
     btn_confirm: ttk.Button
     btn_reload: ttk.Button
     btn_copy_stk: ttk.Button
     btn_copy_order: ttk.Button
+
+    result_queue: queue.Queue = queue.Queue()
 
     def _set_buttons_state(state: str) -> None:
         for b in (btn_confirm, btn_reload, btn_copy_stk, btn_copy_order):
@@ -992,11 +947,108 @@ def show_renewal_window(config: dict[str, Any], reason_text: str = "") -> None:
         if acc:
             _copy_text(acc, "số tài khoản")
 
+    def _poll_queue() -> None:
+        try:
+            while True:
+                kind, payload = result_queue.get_nowait()
+
+                if kind == "basic_success":
+                    public_cfg_result, order_result = payload
+                    bank_id = str(public_cfg_result.get("bank_id", "TCB")).strip()
+                    bank_display_name = str(public_cfg_result.get("bank_display_name", bank_id)).strip()
+                    bank_account_no = str(public_cfg_result.get("bank_account_no", "")).strip()
+                    bank_account_name = str(public_cfg_result.get("bank_account_name", "")).strip()
+                    approval_title = str(public_cfg_result.get("approval_title", "Chờ admin xác nhận trên Telegram")).strip()
+                    approval_note = str(public_cfg_result.get("approval_note", "")).strip()
+                    support_note = str(public_cfg_result.get("support_note", "")).strip()
+
+                    amount = int(order_result.get("amount", 0) or 0)
+                    order_id = str(order_result.get("order_id", "")).strip()
+                    transfer_content = str(order_result.get("transfer_content", order_id)).strip()
+
+                    order_data.clear()
+                    order_data.update(order_result)
+                    public_cfg.clear()
+                    public_cfg.update(public_cfg_result)
+
+                    bank_name_var.set(f"Ngân hàng: {bank_display_name}")
+                    bank_no_var.set(f"Số tài khoản: {bank_account_no}")
+                    bank_owner_var.set(f"Chủ tài khoản: {bank_account_name}")
+                    amount_var.set(f"Số tiền: {amount:,} VNĐ")
+                    order_var.set(f"Nội dung chuyển khoản: {transfer_content}")
+                    approval_var.set(approval_title)
+                    note_var.set(approval_note + ("\n" if approval_note and support_note else "") + support_note)
+
+                    loading_bar.stop()
+                    loading_bar.configure(value=0)
+                    qr_label.configure(image="", text="Đang tải mã QR...")
+                    qr_label.image = None
+                    status_var.set("✅ Đã tạo mã đơn — có thể chuyển khoản ngay, QR đang tải...")
+                    _set_buttons_state("normal")
+
+                elif kind == "qr_ready":
+                    qr_pil = payload
+                    if qr_pil is not None:
+                        try:
+                            qr_img = ImageTk.PhotoImage(qr_pil, master=win)
+                            qr_label.configure(image=qr_img, text="")
+                            qr_label.image = qr_img
+                            status_var.set("✅ Đã tạo mã đơn — chuyển khoản đúng nội dung bên dưới")
+                        except Exception as exc:
+                            print("QR PhotoImage error:", exc)
+                            qr_label.configure(image="", text="(Không tải được mã QR — chuyển khoản thủ công)")
+                            qr_label.image = None
+                            status_var.set("✅ Đã tạo mã đơn (QR không tải được)")
+                    else:
+                        qr_label.configure(image="", text="(Không tải được mã QR — chuyển khoản thủ công)")
+                        qr_label.image = None
+                        status_var.set("✅ Đã tạo mã đơn (QR không tải được)")
+
+                elif kind == "error":
+                    msg = str(payload)
+                    loading_bar.stop()
+                    _set_buttons_state("normal")
+                    status_var.set(f"❌ {msg}")
+                    messagebox.showerror("Lỗi", msg, parent=win)
+
+                elif kind == "confirm_done":
+                    res = payload
+                    _set_buttons_state("normal")
+                    ok = bool(res.get("ok", False))
+                    msg = str(res.get("message") or "Lỗi không xác định")
+                    tg_err = str(res.get("telegram_error") or "").strip()
+                    request_id = str(res.get("request_id") or "").strip()
+
+                    detail = msg
+                    if request_id:
+                        detail += f"\n\nMã yêu cầu: {request_id}"
+                    if tg_err:
+                        detail += f"\n\nChi tiết lỗi Telegram:\n{tg_err}"
+
+                    if ok:
+                        status_var.set(msg)
+                        msg_lower = msg.lower()
+                        tg_failed = (
+                            bool(tg_err)
+                            or ("chưa gửi được telegram" in msg_lower)
+                            or ("không gửi được telegram" in msg_lower)
+                            or ("chưa gửi được thông báo telegram" in msg_lower)
+                        )
+                        if tg_failed:
+                            messagebox.showwarning("Chưa gửi được Telegram", detail, parent=win)
+                        else:
+                            messagebox.showinfo("Đã gửi xác nhận", detail, parent=win)
+                    else:
+                        status_var.set(f"❌ {msg}")
+                        messagebox.showerror("Lỗi gửi xác nhận", detail, parent=win)
+
+        except queue.Empty:
+            pass
+
+        if win.winfo_exists():
+            win.after(30, _poll_queue)
+
     def _reload_order() -> None:
-        """
-        Tải config + tạo order trước để hiện thông tin chuyển khoản ngay.
-        QR tải riêng sau, không được block UI.
-        """
         status_var.set("⏳ Đang tải cấu hình thanh toán...")
         qr_label.configure(image="", text="")
         qr_label.image = None
@@ -1010,13 +1062,10 @@ def show_renewal_window(config: dict[str, Any], reason_text: str = "") -> None:
             return
 
         def worker():
-            nonlocal order_data, public_cfg
-
             public_cfg_result: dict[str, Any] = {}
             order_result: dict[str, Any] = {}
             fetch_error = ""
 
-            # ── Pha 1: lấy config + tạo order song song ─────────────────────
             with ThreadPoolExecutor(max_workers=2) as pool:
                 fut_cfg = pool.submit(get_public_config)
                 fut_order = pool.submit(create_renewal_order, email)
@@ -1032,118 +1081,50 @@ def show_renewal_window(config: dict[str, Any], reason_text: str = "") -> None:
                         fetch_error = str(e)
 
             if fetch_error:
-                def _on_net_err():
-                    status_var.set(f"❌ Lỗi mạng: {fetch_error}")
-                    loading_bar.stop()
-                    _set_buttons_state("normal")
-                _get_root().after(0, _on_net_err)
+                result_queue.put(("error", f"Lỗi mạng: {fetch_error}"))
                 return
 
             if not isinstance(public_cfg_result, dict):
-                def _on_cfg_err():
-                    status_var.set("❌ public-config không hợp lệ")
-                    loading_bar.stop()
-                    _set_buttons_state("normal")
-                _get_root().after(0, _on_cfg_err)
+                result_queue.put(("error", "public-config không hợp lệ"))
                 return
 
             if not isinstance(order_result, dict):
-                def _on_order_type_err():
-                    status_var.set("❌ create-order trả về dữ liệu không hợp lệ")
-                    loading_bar.stop()
-                    _set_buttons_state("normal")
-                _get_root().after(0, _on_order_type_err)
+                result_queue.put(("error", "create-order trả về dữ liệu không hợp lệ"))
                 return
 
             if not order_result.get("ok", False):
-                msg = str(order_result.get("message", "Tạo đơn thất bại"))
-                def _on_order_err():
-                    status_var.set(f"❌ {msg}")
-                    loading_bar.stop()
-                    _set_buttons_state("normal")
-                    messagebox.showerror("Lỗi", msg, parent=win)
-                _get_root().after(0, _on_order_err)
+                result_queue.put(("error", str(order_result.get("message", "Tạo đơn thất bại"))))
                 return
 
+            result_queue.put(("basic_success", (public_cfg_result, order_result)))
+
             bank_id = str(public_cfg_result.get("bank_id", "TCB")).strip()
-            bank_display_name = str(public_cfg_result.get("bank_display_name", bank_id)).strip()
             bank_account_no = str(public_cfg_result.get("bank_account_no", "")).strip()
             bank_account_name = str(public_cfg_result.get("bank_account_name", "")).strip()
-            approval_title = str(
-                public_cfg_result.get("approval_title", "Chờ admin xác nhận trên Telegram")
-            ).strip()
-            approval_note = str(public_cfg_result.get("approval_note", "")).strip()
-            support_note = str(public_cfg_result.get("support_note", "")).strip()
-
             amount = int(order_result.get("amount", 0) or 0)
             order_id = str(order_result.get("order_id", "")).strip()
             transfer_content = str(order_result.get("transfer_content", order_id)).strip()
 
             qr_url = make_vietqr_url(
-                bank_id,
-                bank_account_no,
-                bank_account_name,
-                amount,
-                transfer_content,
+                bank_id, bank_account_no, bank_account_name, amount, transfer_content,
             )
 
-            # ── Pha 2A: hiện thông tin chuyển khoản NGAY ────────────────────
-            def on_basic_success():
-                nonlocal order_data, public_cfg
-                order_data = order_result
-                public_cfg = public_cfg_result
+            def _fetch_qr():
+                qr_pil = None
+                try:
+                    resp = requests.get(qr_url, timeout=8)
+                    resp.raise_for_status()
+                    qr_pil = Image.open(BytesIO(resp.content)).convert("RGB")
+                    qr_pil.thumbnail((280, 280))
+                except Exception as exc:
+                    print("QR fetch error:", exc)
+                result_queue.put(("qr_ready", qr_pil))
 
-                bank_name_var.set(f"Ngân hàng: {bank_display_name}")
-                bank_no_var.set(f"Số tài khoản: {bank_account_no}")
-                bank_owner_var.set(f"Chủ tài khoản: {bank_account_name}")
-                amount_var.set(f"Số tiền: {amount:,} VNĐ")
-                order_var.set(f"Nội dung chuyển khoản: {transfer_content}")
-                approval_var.set(approval_title)
-                note_var.set(approval_note + ("\n" if approval_note and support_note else "") + support_note)
-
-                loading_bar.stop()
-                loading_bar.configure(value=0)
-
-                qr_label.configure(image="", text="Đang tải mã QR...")
-                qr_label.image = None
-                status_var.set("✅ Đã tạo mã đơn — có thể chuyển khoản ngay, QR đang tải...")
-                _set_buttons_state("normal")
-
-            _get_root().after(0, on_basic_success)
-
-            # ── Pha 2B: tải QR RIÊNG, không block UI ────────────────────────
-            qr_pil = None
-            try:
-                resp = requests.get(qr_url, timeout=6)
-                resp.raise_for_status()
-                qr_pil = Image.open(BytesIO(resp.content)).convert("RGB")
-                qr_pil.thumbnail((280, 280))
-            except Exception as exc:
-                print("QR fetch error:", exc)
-
-            def on_qr_ready():
-                if not win.winfo_exists():
-                    return
-                if qr_pil is not None:
-                    try:
-                        qr_img = ImageTk.PhotoImage(qr_pil, master=win)
-                        qr_label.configure(image=qr_img, text="")
-                        qr_label.image = qr_img
-                        status_var.set("✅ Đã tạo mã đơn — chuyển khoản đúng nội dung bên dưới")
-                    except Exception as exc:
-                        print("QR PhotoImage error:", exc)
-                        qr_label.configure(image="", text="(Không tải được mã QR — chuyển khoản thủ công)")
-                        qr_label.image = None
-                        status_var.set("✅ Đã tạo mã đơn (QR không tải được)")
-                else:
-                    qr_label.configure(image="", text="(Không tải được mã QR — chuyển khoản thủ công)")
-                    qr_label.image = None
-                    status_var.set("✅ Đã tạo mã đơn (QR không tải được)")
-
-            _get_root().after(0, on_qr_ready)
+            threading.Thread(target=_fetch_qr, daemon=True).start()
 
         threading.Thread(target=worker, daemon=True).start()
-        def _confirm_transfer() -> None:
+
+    def _confirm_transfer() -> None:
         oid = str(order_data.get("order_id", "")).strip()
         if not oid:
             messagebox.showwarning(
@@ -1174,50 +1155,14 @@ def show_renewal_window(config: dict[str, Any], reason_text: str = "") -> None:
                 res = {"ok": False, "message": f"Lỗi khi gửi xác nhận lên server: {exc}"}
 
             if res is None:
-                res = {
-                    "ok": False,
-                    "message": "Server trả về dữ liệu rỗng (None).",
-                }
+                res = {"ok": False, "message": "Server trả về dữ liệu rỗng (None)."}
             elif not isinstance(res, dict):
-                res = {
-                    "ok": False,
-                    "message": f"Server trả về dữ liệu không hợp lệ: {type(res).__name__}",
-                }
+                res = {"ok": False, "message": f"Server trả về dữ liệu không hợp lệ: {type(res).__name__}"}
 
-            def done():
-                _set_buttons_state("normal")
-                ok = bool(res.get("ok", False))
-                msg = str(res.get("message") or "Lỗi không xác định")
-                tg_err = str(res.get("telegram_error") or "").strip()
-                request_id = str(res.get("request_id") or "").strip()
-
-                detail = msg
-                if request_id:
-                    detail += f"\n\nMã yêu cầu: {request_id}"
-                if tg_err:
-                    detail += f"\n\nChi tiết lỗi Telegram:\n{tg_err}"
-
-                if ok:
-                    status_var.set(msg)
-                    msg_lower = msg.lower()
-                    tg_failed = (
-                        bool(tg_err)
-                        or ("chưa gửi được telegram" in msg_lower)
-                        or ("không gửi được telegram" in msg_lower)
-                        or ("chưa gửi được thông báo telegram" in msg_lower)
-                    )
-                    if tg_failed:
-                        messagebox.showwarning("Chưa gửi được Telegram", detail, parent=win)
-                    else:
-                        messagebox.showinfo("Đã gửi xác nhận", detail, parent=win)
-                else:
-                    status_var.set(f"❌ {msg}")
-                    messagebox.showerror("Lỗi gửi xác nhận", detail, parent=win)
-
-            _get_root().after(0, done)
+            result_queue.put(("confirm_done", res))
 
         threading.Thread(target=worker, daemon=True).start()
-    # ── Buttons ──────────────────────────────────────────────────────────────
+
     btn_confirm = ttk.Button(
         btn_row,
         text="✅ Đã chuyển khoản",
@@ -1249,8 +1194,8 @@ def show_renewal_window(config: dict[str, Any], reason_text: str = "") -> None:
     )
     btn_copy_order.pack(side="left", padx=(8, 0))
 
-    # Tải ngay khi mở window
-    win.after(100, _reload_order)
+    win.after(30, _poll_queue)
+    win.after(0, _reload_order)
     _wait_window(win)
 
 
@@ -1651,14 +1596,8 @@ def show_camera_picker(config: dict[str, Any], message: str = "") -> dict[str, A
         win.destroy()
 
     def _renew() -> None:
-        win.withdraw()
-        try:
-            show_renewal_window(load_config())
-        finally:
-            if win.winfo_exists():
-                win.deiconify()
-                win.lift()
-                win.focus_force()
+        result["action"] = "renew"
+        win.destroy()
 
     def _change_license() -> None:
         new_cfg = show_change_license_window(
@@ -1952,19 +1891,25 @@ def main() -> None:
         config["expires_at"] = checked["expires_at"]
         save_config(config)
 
-    # ── Kiểm tra update ngay sau khi license OK (chạy nền, không delay) ──────
     check_update_async()
 
     while True:
-        config = show_camera_picker(config)
-        if not config:
+        picker_result = show_camera_picker(config)
+        if not picker_result:
             return
+
+        if picker_result.get("action") == "renew":
+            show_renewal_window(load_config())
+            return
+
+        config = picker_result
 
         result = run_recorder(config)
         if not result:
             return
 
         action = result.get("action", "quit")
+
         if action == "quit":
             return
 
@@ -1983,7 +1928,7 @@ def main() -> None:
                 save_config(config)
             continue
 
-        if action in {"camera_failed", "change_camera"}:
+        if action == "change_camera":
             continue
 
 

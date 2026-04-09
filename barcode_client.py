@@ -20,7 +20,7 @@ Barcode Webcam Recorder — Client
 from __future__ import annotations
 
 # ── Version ───────────────────────────────────────────────────────────────────
-APP_VERSION = "1.0.0"   # <-- tăng mỗi lần build exe mới
+APP_VERSION = "1.0.1"   # <-- tăng mỗi lần build exe mới
 GITHUB_EXE_NAME = "BarcodeRecorder.exe"
 GITHUB_REPO = "lalichu99/barcode-recorder"
 

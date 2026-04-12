@@ -18,12 +18,19 @@ Barcode Webcam Recorder — Client
 """
 
 from __future__ import annotations
+from dotenv import load_dotenv
+from pathlib import Path
+import sys
 
+if getattr(sys, "frozen", False):
+    load_dotenv(Path(sys.executable).resolve().parent / ".env")
+else:
+    load_dotenv(Path(__file__).resolve().parent / ".env")
 # ── Version ───────────────────────────────────────────────────────────────────
 APP_VERSION = "1.0.1"   # <-- tăng mỗi lần build exe mới
 GITHUB_EXE_NAME = "BarcodeRecorder.exe"
 GITHUB_REPO = "lalichu99/barcode-recorder"
-
+GOOGLE_DRIVE_EXE_URL = "https://drive.google.com/uc?export=download&id=1oPwgYlqCqT0DEeyAOxDo9r5d31eCSJU9"
 # ── Bootstrap: cài thư viện nếu thiếu (chỉ chạy lần đầu) ────────────────────
 def _bootstrap() -> None:
     return
@@ -531,56 +538,146 @@ def check_for_update() -> dict[str, Any] | None:
         data = r.json()
 
         latest_tag = str(data.get("tag_name", "0")).lstrip("v")
+
         if _parse_version(latest_tag) <= _parse_version(APP_VERSION):
-            return None
-
-        download_url = ""
-        for asset in data.get("assets", []):
-            name = str(asset.get("name", ""))
-            if name.lower().endswith(".exe"):
-                download_url = str(asset.get("browser_download_url", ""))
-                break
-
-        if not download_url:
             return None
 
         return {
             "latest": latest_tag,
             "current": APP_VERSION,
-            "download_url": download_url,
+            "download_url": GOOGLE_DRIVE_EXE_URL,
             "release_notes": str(data.get("body", "")).strip()[:500],
             "published_at": str(data.get("published_at", "")),
         }
-    except Exception:
+    except Exception as exc:
+        err_text = str(exc)
+        try:
+            _get_root().after(
+                0,
+                lambda msg=err_text: messagebox.showerror(
+                    "Lỗi kiểm tra update",
+                    f"Không gọi được GitHub API:\n{msg}",
+                    parent=_get_root(),
+                ),
+            )
+        except Exception:
+            pass
         return None
+def _download_update(url: str, dest: Path, progress_cb=None, status_cb=None) -> None:
+    session = requests.Session()
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+    }
 
+    if status_cb:
+        status_cb("Đang kết nối máy chủ tải...")
 
-def _download_update(url: str, dest: Path, progress_cb=None) -> None:
-    with requests.get(url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("Content-Length", 0))
+    def _stream_to_file(resp):
+        resp.raise_for_status()
+        total = int(resp.headers.get("Content-Length", 0))
         downloaded = 0
+
+        if status_cb:
+            status_cb("Đang tải bản cập nhật...")
+
         with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=65536):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if progress_cb and total > 0:
-                        progress_cb(int(downloaded * 100 / total))
+            for chunk in resp.iter_content(chunk_size=262144):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                downloaded += len(chunk)
+                if progress_cb and total > 0:
+                    progress_cb(min(100, int(downloaded * 100 / total)))
 
+    r = session.get(url, stream=True, timeout=(15, 180), allow_redirects=True, headers=headers)
+    r.raise_for_status()
 
-def _write_updater_bat(new_exe: Path, current_exe: Path) -> Path:
+    content_type = (r.headers.get("Content-Type") or "").lower()
+    final_url = str(r.url)
+
+    # Nếu đã là file thật
+    if "text/html" not in content_type and "download_warning" not in final_url:
+        _stream_to_file(r)
+        return
+
+    # Google Drive trang cảnh báo file lớn
+    html = r.text
+
+    if status_cb:
+        status_cb("Đang xác nhận tải từ Google Drive...")
+
+    # Cách 1: lấy link confirm trực tiếp
+    m = re.search(r'href="([^"]*download[^"]*confirm[^"]*)"', html)
+    if m:
+        confirm_url = m.group(1).replace("&amp;", "&")
+        if confirm_url.startswith("/"):
+            confirm_url = "https://drive.google.com" + confirm_url
+        r2 = session.get(confirm_url, stream=True, timeout=(15, 180), allow_redirects=True, headers=headers)
+        _stream_to_file(r2)
+        return
+
+    # Cách 2: lấy form confirm
+    form_match = re.search(
+        r'<form[^>]+id="download-form"[^>]+action="([^"]+)"[^>]*>(.*?)</form>',
+        html,
+        re.S | re.I,
+    )
+    if form_match:
+        action = form_match.group(1).replace("&amp;", "&")
+        form_html = form_match.group(2)
+
+        inputs = dict(re.findall(r'name="([^"]+)"\s+value="([^"]*)"', form_html))
+        if action.startswith("/"):
+            action = "https://drive.google.com" + action
+
+        r2 = session.get(action, params=inputs, stream=True, timeout=(15, 180), allow_redirects=True, headers=headers)
+        _stream_to_file(r2)
+        return
+
+    # Cách 3: lấy confirm token kiểu cũ
+    m = re.search(r'confirm=([0-9A-Za-z_-]+)', html)
+    if m:
+        confirm_token = m.group(1)
+        sep = "&" if "?" in url else "?"
+        confirm_url = f"{url}{sep}confirm={confirm_token}"
+        r2 = session.get(confirm_url, stream=True, timeout=(15, 180), allow_redirects=True, headers=headers)
+        _stream_to_file(r2)
+        return
+
+    raise RuntimeError("Không vượt qua được trang xác nhận tải của Google Drive.")
+def _write_updater_bat(new_exe: Path, current_exe: Path, new_version: str, old_version: str) -> Path:
     bat_path = new_exe.parent / "_updater.bat"
+
+    old_backup = f"{current_exe.stem}_{old_version}_old{current_exe.suffix}"
+
     bat_content = f"""@echo off
+cd /d "{new_exe.parent}"
+
 timeout /t 3 /nobreak >nul
-move /y "{new_exe}" "{current_exe}"
-start "" "{current_exe}"
+
+echo Đang đổi tên file cũ...
+
+if exist "{current_exe.name}" (
+    move /y "{current_exe.name}" "{old_backup}"
+)
+
+echo Đang cập nhật phiên bản mới...
+
+:retry
+move /y "{new_exe.name}" "{current_exe.name}" >nul 2>nul
+if exist "{new_exe.name}" (
+    timeout /t 2 /nobreak >nul
+    goto retry
+)
+
+echo Mở app mới...
+
+start "" "{current_exe.name}"
+
 del "%~f0"
 """
     bat_path.write_text(bat_content, encoding="utf-8")
     return bat_path
-
-
 def show_update_dialog(update_info: dict[str, Any]) -> None:
     latest = update_info["latest"]
     current = update_info["current"]
@@ -591,7 +688,7 @@ def show_update_dialog(update_info: dict[str, Any]) -> None:
         f"Có bản cập nhật mới — v{latest}",
         f"Phiên bản hiện tại: v{current}\n"
         f"Phiên bản mới:      v{latest}\n\n"
-        f"{'Ghi chú:\n' + notes + chr(10) + chr(10) if notes else ''}"
+        f"{('Ghi chú:\\n' + notes + chr(10) + chr(10)) if notes else ''}"
         "Bạn có muốn tải và cập nhật ngay không?\n"
         "(App sẽ tự khởi động lại sau khi tải xong)",
         parent=_get_root(),
@@ -601,13 +698,16 @@ def show_update_dialog(update_info: dict[str, Any]) -> None:
 
     dl_win = _toplevel("Đang tải cập nhật...", "460x140", resizable=False)
     dl_frame = _make_main_container(dl_win, 20)
+
     ttk.Label(dl_frame, text=f"Đang tải v{latest}...", style="Title.TLabel").pack(anchor="w")
+    status_var = tk.StringVar(value="Đang chuẩn bị tải...")
+    ttk.Label(dl_frame, textvariable=status_var, style="Muted.TLabel").pack(anchor="w", pady=(4, 6))
     pct_var = tk.StringVar(value="0%")
     ttk.Label(dl_frame, textvariable=pct_var, style="Muted.TLabel").pack(anchor="w", pady=(4, 8))
     bar = ttk.Progressbar(dl_frame, mode="determinate", maximum=100)
     bar.pack(fill="x")
 
-    dl_win.update()
+    dl_win.update_idletasks()
 
     if getattr(sys, "frozen", False):
         current_exe = Path(sys.executable)
@@ -615,64 +715,99 @@ def show_update_dialog(update_info: dict[str, Any]) -> None:
         current_exe = Path(sys.argv[0])
 
     new_exe = current_exe.parent / f"_update_{latest}.exe"
-    err_holder: list[str] = []
+
+    ui_queue: queue.Queue = queue.Queue()
+
+    def _process_ui_queue():
+        try:
+            while True:
+                kind, payload = ui_queue.get_nowait()
+
+                if kind == "status":
+                    status_var.set(str(payload))
+
+                elif kind == "progress":
+                    pct = int(payload)
+                    bar.configure(value=pct)
+                    pct_var.set(f"{pct}%")
+                elif kind == "finish":
+                    bar.configure(value=100)
+                    pct_var.set("100% — Đang khởi động lại...")
+                    dl_win.update_idletasks()
+                    try:
+                        bat = _write_updater_bat(
+                            new_exe,
+                            current_exe,
+                            latest,   # version mới (1.0.1)
+                            current   # version cũ (1.0.0)
+                        )
+                        subprocess.Popen(
+                            [str(bat)],
+                            shell=True,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        )
+                    except Exception as e:
+                        messagebox.showerror(
+                            "Lỗi",
+                            f"Không thể chạy updater:\n{e}",
+                            parent=dl_win,
+                        )
+                        try:
+                            if new_exe.exists():
+                                new_exe.unlink()
+                        except Exception:
+                            pass
+                        dl_win.destroy()
+                        return
+
+                    dl_win.destroy()
+                    _get_root().quit()
+                    sys.exit(0)
+
+                elif kind == "error":
+                    err_msg = str(payload)
+                    try:
+                        if new_exe.exists():
+                            new_exe.unlink()
+                    except Exception:
+                        pass
+
+                    dl_win.destroy()
+                    messagebox.showerror(
+                        "Tải thất bại",
+                        f"Không tải được bản cập nhật:\n{err_msg}\n\n"
+                        f"Bạn có thể tải thủ công tại:\n{download_url}",
+                        parent=_get_root(),
+                    )
+                    return
+
+        except queue.Empty:
+            pass
+
+        if dl_win.winfo_exists():
+            dl_win.after(50, _process_ui_queue)
 
     def _do_download():
         try:
             def on_progress(pct: int):
-                dl_win.after(0, lambda: (
-                    bar.configure(value=pct),
-                    pct_var.set(f"{pct}%"),
-                ))
+                ui_queue.put(("progress", pct))
 
-            _download_update(download_url, new_exe, progress_cb=on_progress)
+            def on_status(text: str):
+                ui_queue.put(("status", text))
 
-            def _finish():
-                bar.configure(value=100)
-                pct_var.set("100% — Đang khởi động lại...")
-                dl_win.update()
-                try:
-                    bat = _write_updater_bat(new_exe, current_exe)
-                    subprocess.Popen(
-                        [str(bat)],
-                        shell=True,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    )
-                except Exception as e:
-                    messagebox.showerror("Lỗi", f"Không thể chạy updater:\n{e}", parent=dl_win)
-                    dl_win.destroy()
-                    return
-                dl_win.destroy()
-                _get_root().quit()
-                sys.exit(0)
-
-            dl_win.after(0, _finish)
+            _download_update(
+                download_url,
+                new_exe,
+                progress_cb=on_progress,
+                status_cb=on_status,
+            )
+            ui_queue.put(("finish", None))
 
         except Exception as exc:
-            err_holder.append(str(exc))
-
-            def _on_err():
-                dl_win.destroy()
-                messagebox.showerror(
-                    "Tải thất bại",
-                    f"Không tải được bản cập nhật:\n{err_holder[0]}\n\n"
-                    "Bạn có thể tải thủ công tại:\n" + download_url,
-                    parent=_get_root(),
-                )
-
-            dl_win.after(0, _on_err)
-
+            ui_queue.put(("error", str(exc)))
+    dl_win.after(50, _process_ui_queue)
     threading.Thread(target=_do_download, daemon=True).start()
     _wait_window(dl_win)
-
-
-def check_update_async() -> None:
-    def _worker():
-        info = check_for_update()
-        if info:
-            _get_root().after(0, lambda: show_update_dialog(info))
-
-    threading.Thread(target=_worker, daemon=True).start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1226,6 +1361,7 @@ def show_change_license_window(config: dict[str, Any], message_text: str = "") -
     code_var = tk.StringVar(value="")
     key_var = tk.StringVar(value=str(config.get("license_key", "") or ""))
     status_var = tk.StringVar(value=message_text)
+    ui_queue: queue.Queue = queue.Queue()
 
     ttk.Label(frame, text="Email", style="App.TLabel").pack(anchor="w")
     email_entry = ttk.Entry(frame, textvariable=email_var)
@@ -1264,6 +1400,31 @@ def show_change_license_window(config: dict[str, Any], message_text: str = "") -
     btn_row = ttk.Frame(frame, style="App.TFrame")
     btn_row.pack(fill="x", side="bottom", pady=(18, 0))
 
+    def _poll_queue() -> None:
+        try:
+            while True:
+                kind, payload = ui_queue.get_nowait()
+
+                if kind == "status":
+                    status_var.set(str(payload))
+
+                elif kind == "focus_code":
+                    if win.winfo_exists():
+                        code_entry.focus_set()
+
+                elif kind == "success":
+                    cfg = payload
+                    if isinstance(cfg, dict):
+                        result.update(cfg)
+                    if win.winfo_exists():
+                        win.destroy()
+
+        except queue.Empty:
+            pass
+
+        if win.winfo_exists():
+            win.after(30, _poll_queue)
+
     def _send_code() -> None:
         email = email_var.get().strip().lower()
         if not email:
@@ -1274,8 +1435,8 @@ def show_change_license_window(config: dict[str, Any], message_text: str = "") -
 
         def _worker():
             res = send_login_code(email)
-            win.after(0, lambda: status_var.set(str(res.get("message", ""))))
-            win.after(0, code_entry.focus_set)
+            ui_queue.put(("status", str(res.get("message", ""))))
+            ui_queue.put(("focus_code", None))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1334,20 +1495,16 @@ def show_change_license_window(config: dict[str, Any], message_text: str = "") -
         def _worker():
             res = verify_email_code(email, code)
             if not res.get("ok"):
-                win.after(0, lambda: status_var.set(str(res.get("message", "Không đăng nhập được."))))
+                ui_queue.put(("status", str(res.get("message", "Không đăng nhập được."))))
                 return
+
             cfg = load_config()
             if "camera_index" not in cfg and "camera_index" in config:
                 cfg["camera_index"] = config.get("camera_index")
             if "save_dir" not in cfg:
                 cfg["save_dir"] = config.get("save_dir") or default_save_dir()
             save_config(cfg)
-
-            def _done():
-                result.update(cfg)
-                win.destroy()
-
-            win.after(0, _done)
+            ui_queue.put(("success", cfg))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1368,20 +1525,16 @@ def show_change_license_window(config: dict[str, Any], message_text: str = "") -
         def _worker():
             res = activate_license(email, key)
             if not res.get("ok"):
-                win.after(0, lambda: status_var.set(str(res.get("message", "Không đổi được license."))))
+                ui_queue.put(("status", str(res.get("message", "Không đổi được license."))))
                 return
+
             cfg = load_config()
             if "camera_index" not in cfg and "camera_index" in config:
                 cfg["camera_index"] = config.get("camera_index")
             if "save_dir" not in cfg:
                 cfg["save_dir"] = config.get("save_dir") or default_save_dir()
             save_config(cfg)
-
-            def _done():
-                result.update(cfg)
-                win.destroy()
-
-            win.after(0, _done)
+            ui_queue.put(("success", cfg))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1408,6 +1561,7 @@ def show_change_license_window(config: dict[str, Any], message_text: str = "") -
     ).pack(side="right", padx=(0, 8))
     ttk.Button(btn_row, text="Xóa license cũ", command=_clear_only, width=14).pack(side="left")
 
+    win.after(30, _poll_queue)
     email_entry.focus_set()
     _wait_window(win)
     return result
@@ -1436,6 +1590,7 @@ def show_setup_window(config: dict[str, Any], message_text: str = "") -> dict[st
     email_var = tk.StringVar(value=str(config.get("email", "") or ""))
     code_var = tk.StringVar(value="")
     status_var = tk.StringVar(value=message_text)
+    ui_queue: queue.Queue = queue.Queue()
 
     ttk.Label(frame, text="Email", style="App.TLabel").pack(anchor="w")
     email_entry = ttk.Entry(frame, textvariable=email_var)
@@ -1448,7 +1603,32 @@ def show_setup_window(config: dict[str, Any], message_text: str = "") -> dict[st
     code_entry = ttk.Entry(row, textvariable=code_var)
     code_entry.pack(side="left", fill="x", expand=True, ipady=4)
 
-    def _send():
+    def _poll_queue() -> None:
+        try:
+            while True:
+                kind, payload = ui_queue.get_nowait()
+
+                if kind == "status":
+                    status_var.set(str(payload))
+
+                elif kind == "focus_code":
+                    if win.winfo_exists():
+                        code_entry.focus_set()
+
+                elif kind == "success":
+                    cfg = payload
+                    if isinstance(cfg, dict):
+                        result.update(cfg)
+                    if win.winfo_exists():
+                        win.destroy()
+
+        except queue.Empty:
+            pass
+
+        if win.winfo_exists():
+            win.after(30, _poll_queue)
+
+    def _send() -> None:
         email = email_var.get().strip().lower()
         if not email:
             messagebox.showwarning("Thiếu email", "Nhập email trước", parent=win)
@@ -1458,7 +1638,8 @@ def show_setup_window(config: dict[str, Any], message_text: str = "") -> dict[st
 
         def _worker():
             res = send_login_code(email)
-            win.after(0, lambda: status_var.set(res.get("message", "")))
+            ui_queue.put(("status", res.get("message", "")))
+            ui_queue.put(("focus_code", None))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1466,7 +1647,7 @@ def show_setup_window(config: dict[str, Any], message_text: str = "") -> dict[st
 
     ttk.Label(frame, textvariable=status_var, style="Error.TLabel").pack(anchor="w", pady=8)
 
-    def _submit():
+    def _submit() -> None:
         email = email_var.get().strip().lower()
         code = code_var.get().strip()
 
@@ -1480,18 +1661,14 @@ def show_setup_window(config: dict[str, Any], message_text: str = "") -> dict[st
         def _worker():
             res = verify_email_code(email, code)
             if not res.get("ok"):
-                win.after(0, lambda: status_var.set(res.get("message", "Lỗi xác minh")))
+                ui_queue.put(("status", res.get("message", "Lỗi xác minh")))
                 return
+
             cfg = load_config()
             cfg["camera_index"] = 0
             cfg["save_dir"] = default_save_dir()
             save_config(cfg)
-
-            def _done():
-                result.update(cfg)
-                win.destroy()
-
-            win.after(0, _done)
+            ui_queue.put(("success", cfg))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1501,6 +1678,7 @@ def show_setup_window(config: dict[str, Any], message_text: str = "") -> dict[st
     ttk.Button(btn_row, text="Thoát", command=win.destroy).pack(side="right")
     ttk.Button(btn_row, text="Vào app", command=_submit, style="Accent.TButton").pack(side="right", padx=8)
 
+    win.after(30, _poll_queue)
     email_entry.focus_set()
     _wait_window(win)
     return result
@@ -1891,7 +2069,10 @@ def main() -> None:
         config["expires_at"] = checked["expires_at"]
         save_config(config)
 
-    check_update_async()
+    # Kiểm tra update đồng bộ TRƯỚC khi show camera picker
+    update_info = check_for_update()
+    if update_info:
+        show_update_dialog(update_info)
 
     while True:
         picker_result = show_camera_picker(config)

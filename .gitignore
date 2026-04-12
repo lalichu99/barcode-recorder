@@ -1,0 +1,44 @@
+# ================== ENV (QUAN TRỌNG) ==================
+.env
+.env.*
+!.env.example
+
+# ================== DATABASE ==================
+*.db
+*.sqlite3
+
+# ================== CONFIG / SECRETS ==================
+config.json
+Credentials.json
+service_account.json
+*.key
+*.pem
+
+# ================== PYTHON ==================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ================== LOG ==================
+*.log
+
+# ================== OS ==================
+.DS_Store
+Thumbs.db
+
+# ================== IDE ==================
+.vscode/
+.idea/
+
+# ================== BUILD ==================
+dist/
+build/
+
+# ================== OPTIONAL (nếu không muốn push client/test) ==================
+# barcode_client_clean_overlay.py
+# barcode_client_ipcam_time.py
+
+# ================== OTHER ==================
+*.bak
+*.tmp

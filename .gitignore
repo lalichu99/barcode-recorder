@@ -34,6 +34,15 @@ Thumbs.db
 # ================== BUILD ==================
 dist/
 build/
+*.spec
+
+# ================== AUTO UPDATE / TEMP EXE ==================
+_updater.bat
+_update_*.exe
+*_old.exe
+
+# ================== LOCAL RELEASE FILE ==================
+BarcodeRecorder.exe
 
 # ================== OPTIONAL (nếu không muốn push client/test) ==================
 # barcode_client_clean_overlay.py
